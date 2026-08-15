@@ -34,10 +34,22 @@ SYMBOLS = {
 
 # الفريمات المدعومة
 TIMEFRAMES = {
+    "1m": {"interval": "1min", "size": 400, "label": "دقيقة"},
+    "5m": {"interval": "5min", "size": 400, "label": "5 دقائق"},
+    "15m": {"interval": "15min", "size": 400, "label": "15 دقيقة"},
+    "30m": {"interval": "30min", "size": 400, "label": "30 دقيقة"},
+    "45m": {"interval": "45min", "size": 400, "label": "45 دقيقة"},
     "1h": {"interval": "1h", "size": 400, "label": "ساعة"},
+    "2h": {"interval": "2h", "size": 400, "label": "ساعتين"},
     "4h": {"interval": "4h", "size": 400, "label": "4 ساعات"},
+    "8h": {"interval": "8h", "size": 400, "label": "8 ساعات"},
     "1d": {"interval": "1day", "size": 500, "label": "يومي"},
+    "1w": {"interval": "1week", "size": 400, "label": "أسبوعي"},
+    "1M": {"interval": "1month", "size": 300, "label": "شهري"},
 }
+
+# الفريمات اللي تعطي إشارات كثيرة وضجيج عالي
+NOISY_TIMEFRAMES = {"1m", "5m", "15m"}
 
 API_URL = "https://api.twelvedata.com/time_series"
 
@@ -257,5 +269,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
         "reasons": reasons,
         "candles": len(data),
         "ma200_available": ma200_value is not None,
+        "noisy": timeframe in NOISY_TIMEFRAMES,
         "last_update": data.index[-1].strftime("%Y-%m-%d %H:%M"),
     }
