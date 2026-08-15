@@ -1,40 +1,51 @@
 """
 تحليل فني للأسهم والذهب.
-البيانات من Yahoo Finance عبر مكتبة yfinance.
+البيانات من Stooq — مجاني، بدون مفتاح، ويشتغل من سيرفرات السحابة.
 """
 
-import pandas as pd
-import yfinance as yf
+import io
+from datetime import datetime, timedelta
 
-# الرموز المتابَعة. المفتاح = ما تكتبه أنت، القيمة = رمز ياهو
+import pandas as pd
+import requests
+
+# الرموز المتابَعة. المفتاح = ما تكتبه أنت، القيمة = رمز Stooq
 SYMBOLS = {
-    "GOLD": "GC=F",      # عقود الذهب الآجلة (COMEX)
-    "XAUUSD": "GC=F",    # اسم بديل لنفس الشيء
-    "NVDA": "NVDA",
-    "TSLA": "TSLA",
-    "AMD": "AMD",
-    "MU": "MU",          # Micron Technology
-    "CRDO": "CRDO",
-    "CBRS": "CBRS",      # Cerebras Systems
-    "PLTR": "PLTR",
-    "SPCX": "SPCX",      # SpaceX
-    "AMBA": "AMBA",
-    "MRVL": "MRVL",
-    "ALAB": "ALAB",
-    "ARM": "ARM",
-    "AVGO": "AVGO",
-    "RKLB": "RKLB",
-    "ASTS": "ASTS",
-    "NBIS": "NBIS",
-    "COHR": "COHR",
-    "MSFT": "MSFT",
+    "GOLD": "xauusd",     # الذهب مقابل الدولار
+    "XAUUSD": "xauusd",
+    "NVDA": "nvda.us",
+    "TSLA": "tsla.us",
+    "AMD": "amd.us",
+    "MU": "mu.us",
+    "CRDO": "crdo.us",
+    "CBRS": "cbrs.us",
+    "PLTR": "pltr.us",
+    "SPCX": "spcx.us",
+    "AMBA": "amba.us",
+    "MRVL": "mrvl.us",
+    "ALAB": "alab.us",
+    "ARM": "arm.us",
+    "AVGO": "avgo.us",
+    "RKLB": "rklb.us",
+    "ASTS": "asts.us",
+    "NBIS": "nbis.us",
+    "COHR": "cohr.us",
+    "MSFT": "msft.us",
 }
 
-# إعدادات كل فريم: كم يوم نسحب من التاريخ، وأي interval من ياهو
+# إعدادات الفريمات
+# Stooq يوفر: d (يومي) و 60 دقيقة للفريمات الأصغر
 TIMEFRAMES = {
-    "1h": {"period": "60d", "interval": "1h", "resample": None, "label": "ساعة"},
-    "4h": {"period": "180d", "interval": "1h", "resample": "4h", "label": "4 ساعات"},
-    "1d": {"period": "2y", "interval": "1d", "resample": None, "label": "يومي"},
+    "1h": {"interval": "60", "resample": None, "days": 120, "label": "ساعة"},
+    "4h": {"interval": "60", "resample": "4h", "days": 400, "label": "4 ساعات"},
+    "1d": {"interval": "d", "resample": None, "days": 900, "label": "يومي"},
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
 }
 
 
@@ -42,27 +53,76 @@ class NotEnoughData(Exception):
     """البيانات المتاحة أقل من المطلوب لحساب مؤشر موثوق."""
 
 
+def _download_daily(symbol: str) -> pd.DataFrame:
+    """تحميل الشموع اليومية من Stooq."""
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+
+    text = response.text.strip()
+    if not text or text.lower().startswith("no data") or "Date" not in text[:100]:
+        raise NotEnoughData(f"ما فيه بيانات متاحة للرمز")
+
+    frame = pd.read_csv(io.StringIO(text), parse_dates=["Date"])
+    frame = frame.set_index("Date").sort_index()
+    return frame
+
+
+def _download_intraday(symbol: str) -> pd.DataFrame:
+    """تحميل شموع الساعة من Stooq."""
+    url = f"https://stooq.com/q/l/?s={symbol}&i=60"
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+
+    text = response.text.strip()
+    if not text or "Date" not in text[:100]:
+        raise NotEnoughData("ما فيه بيانات ساعية متاحة لهذا الرمز")
+
+    frame = pd.read_csv(io.StringIO(text))
+
+    if "Date" in frame.columns and "Time" in frame.columns:
+        frame["Datetime"] = pd.to_datetime(
+            frame["Date"].astype(str) + " " + frame["Time"].astype(str)
+        )
+        frame = frame.set_index("Datetime").sort_index()
+        frame = frame.drop(columns=["Date", "Time"], errors="ignore")
+    else:
+        raise NotEnoughData("صيغة البيانات الساعية غير متوقعة")
+
+    return frame
+
+
 def fetch_candles(symbol_key: str, timeframe: str) -> pd.DataFrame:
     """يجلب الشموع ويحوّلها للفريم المطلوب."""
-    yahoo_symbol = SYMBOLS.get(symbol_key.upper(), symbol_key.upper())
+    stooq_symbol = SYMBOLS.get(symbol_key.upper())
+    if stooq_symbol is None:
+        # رمز غير مسجّل — نفترض أنه سهم أمريكي
+        stooq_symbol = f"{symbol_key.lower()}.us"
+
     config = TIMEFRAMES[timeframe]
 
-    data = yf.download(
-        yahoo_symbol,
-        period=config["period"],
-        interval=config["interval"],
-        auto_adjust=False,
-        progress=False,
-    )
+    try:
+        if config["interval"] == "d":
+            data = _download_daily(stooq_symbol)
+        else:
+            data = _download_intraday(stooq_symbol)
+    except NotEnoughData:
+        raise
+    except Exception as error:
+        raise NotEnoughData(f"ما قدرت أجيب البيانات: {error}")
 
-    if data is None or data.empty:
-        raise NotEnoughData(f"ما وصلت بيانات للرمز {symbol_key}")
+    required = {"Open", "High", "Low", "Close"}
+    if not required.issubset(set(data.columns)):
+        raise NotEnoughData("البيانات ناقصة أعمدة أساسية")
 
-    # yfinance أحياناً يرجع أعمدة متعددة المستويات
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    if "Volume" not in data.columns:
+        data["Volume"] = 0
 
-    data = data.dropna()
+    data = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+    # قص الفترة المطلوبة
+    cutoff = datetime.now() - timedelta(days=config["days"])
+    data = data[data.index >= cutoff]
 
     # تجميع شموع الساعة إلى 4 ساعات
     if config["resample"]:
@@ -145,7 +205,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
 
     support, resistance = find_levels(data)
 
-    # تحديد الاتجاه
     reasons = []
     trend_score = 0
 
@@ -174,7 +233,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         trend = "عرضي"
 
-    # حالة RSI
     if rsi_value >= 70:
         rsi_state = "تشبع شرائي"
         reasons.append(f"RSI {rsi_value:.0f} — تشبع شرائي")
@@ -184,7 +242,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         rsi_state = "محايد"
 
-    # القرار
     if trend == "صاعد" and rsi_value < 70:
         signal = "BUY"
     elif trend == "هابط" and rsi_value > 30:
@@ -192,7 +249,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         signal = "HOLD"
 
-    # مستويات الصفقة محسوبة من ATR
     if signal == "BUY":
         entry = price
         stop_loss = price - (atr_value * 1.5)
@@ -206,13 +262,14 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         entry = stop_loss = take_profit_1 = take_profit_2 = None
 
-    # مستوى المخاطرة من التذبذب
     if atr_percent < 1.5:
         risk = "منخفضة"
     elif atr_percent < 3.5:
         risk = "متوسطة"
     else:
         risk = "عالية"
+
+    last_candle = data.index[-1]
 
     return {
         "symbol": symbol_key.upper(),
@@ -233,4 +290,5 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
         "reasons": reasons,
         "candles": len(data),
         "ma200_available": ma200_value is not None,
+        "last_update": last_candle.strftime("%Y-%m-%d"),
     }
