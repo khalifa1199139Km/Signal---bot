@@ -1,145 +1,114 @@
 """
 تحليل فني للأسهم والذهب.
-البيانات من Stooq — مجاني، بدون مفتاح، ويشتغل من سيرفرات السحابة.
+البيانات من Twelve Data — يحتاج مفتاح مجاني من twelvedata.com
 """
 
-import io
-from datetime import datetime, timedelta
+import os
 
 import pandas as pd
 import requests
 
-# الرموز المتابَعة. المفتاح = ما تكتبه أنت، القيمة = رمز Stooq
+# الرموز المتابَعة. المفتاح = ما تكتبه أنت، القيمة = رمز Twelve Data
 SYMBOLS = {
-    "GOLD": "xauusd",     # الذهب مقابل الدولار
-    "XAUUSD": "xauusd",
-    "NVDA": "nvda.us",
-    "TSLA": "tsla.us",
-    "AMD": "amd.us",
-    "MU": "mu.us",
-    "CRDO": "crdo.us",
-    "CBRS": "cbrs.us",
-    "PLTR": "pltr.us",
-    "SPCX": "spcx.us",
-    "AMBA": "amba.us",
-    "MRVL": "mrvl.us",
-    "ALAB": "alab.us",
-    "ARM": "arm.us",
-    "AVGO": "avgo.us",
-    "RKLB": "rklb.us",
-    "ASTS": "asts.us",
-    "NBIS": "nbis.us",
-    "COHR": "cohr.us",
-    "MSFT": "msft.us",
+    "GOLD": "XAU/USD",
+    "XAUUSD": "XAU/USD",
+    "NVDA": "NVDA",
+    "TSLA": "TSLA",
+    "AMD": "AMD",
+    "MU": "MU",
+    "CRDO": "CRDO",
+    "CBRS": "CBRS",
+    "PLTR": "PLTR",
+    "SPCX": "SPCX",
+    "AMBA": "AMBA",
+    "MRVL": "MRVL",
+    "ALAB": "ALAB",
+    "ARM": "ARM",
+    "AVGO": "AVGO",
+    "RKLB": "RKLB",
+    "ASTS": "ASTS",
+    "NBIS": "NBIS",
+    "COHR": "COHR",
+    "MSFT": "MSFT",
 }
 
-# إعدادات الفريمات
-# Stooq يوفر: d (يومي) و 60 دقيقة للفريمات الأصغر
+# الفريمات المدعومة
 TIMEFRAMES = {
-    "1h": {"interval": "60", "resample": None, "days": 120, "label": "ساعة"},
-    "4h": {"interval": "60", "resample": "4h", "days": 400, "label": "4 ساعات"},
-    "1d": {"interval": "d", "resample": None, "days": 900, "label": "يومي"},
+    "1h": {"interval": "1h", "size": 400, "label": "ساعة"},
+    "4h": {"interval": "4h", "size": 400, "label": "4 ساعات"},
+    "1d": {"interval": "1day", "size": 500, "label": "يومي"},
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    )
-}
+API_URL = "https://api.twelvedata.com/time_series"
 
 
 class NotEnoughData(Exception):
     """البيانات المتاحة أقل من المطلوب لحساب مؤشر موثوق."""
 
 
-def _download_daily(symbol: str) -> pd.DataFrame:
-    """تحميل الشموع اليومية من Stooq."""
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-
-    text = response.text.strip()
-    if not text or text.lower().startswith("no data") or "Date" not in text[:100]:
-        raise NotEnoughData(f"ما فيه بيانات متاحة للرمز")
-
-    frame = pd.read_csv(io.StringIO(text), parse_dates=["Date"])
-    frame = frame.set_index("Date").sort_index()
-    return frame
-
-
-def _download_intraday(symbol: str) -> pd.DataFrame:
-    """تحميل شموع الساعة من Stooq."""
-    url = f"https://stooq.com/q/l/?s={symbol}&i=60"
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-
-    text = response.text.strip()
-    if not text or "Date" not in text[:100]:
-        raise NotEnoughData("ما فيه بيانات ساعية متاحة لهذا الرمز")
-
-    frame = pd.read_csv(io.StringIO(text))
-
-    if "Date" in frame.columns and "Time" in frame.columns:
-        frame["Datetime"] = pd.to_datetime(
-            frame["Date"].astype(str) + " " + frame["Time"].astype(str)
-        )
-        frame = frame.set_index("Datetime").sort_index()
-        frame = frame.drop(columns=["Date", "Time"], errors="ignore")
-    else:
-        raise NotEnoughData("صيغة البيانات الساعية غير متوقعة")
-
-    return frame
-
-
 def fetch_candles(symbol_key: str, timeframe: str) -> pd.DataFrame:
-    """يجلب الشموع ويحوّلها للفريم المطلوب."""
-    stooq_symbol = SYMBOLS.get(symbol_key.upper())
-    if stooq_symbol is None:
-        # رمز غير مسجّل — نفترض أنه سهم أمريكي
-        stooq_symbol = f"{symbol_key.lower()}.us"
+    """يجلب الشموع من Twelve Data."""
+    api_key = os.environ.get("TWELVE_DATA_KEY")
+    if not api_key:
+        raise NotEnoughData("مفتاح Twelve Data غير موجود في الإعدادات")
 
+    symbol = SYMBOLS.get(symbol_key.upper(), symbol_key.upper())
     config = TIMEFRAMES[timeframe]
 
+    params = {
+        "symbol": symbol,
+        "interval": config["interval"],
+        "outputsize": config["size"],
+        "apikey": api_key,
+        "format": "JSON",
+    }
+
     try:
-        if config["interval"] == "d":
-            data = _download_daily(stooq_symbol)
-        else:
-            data = _download_intraday(stooq_symbol)
-    except NotEnoughData:
-        raise
+        response = requests.get(API_URL, params=params, timeout=25)
+        payload = response.json()
     except Exception as error:
-        raise NotEnoughData(f"ما قدرت أجيب البيانات: {error}")
+        raise NotEnoughData(f"فشل الاتصال بمزود البيانات: {error}")
 
-    required = {"Open", "High", "Low", "Close"}
-    if not required.issubset(set(data.columns)):
-        raise NotEnoughData("البيانات ناقصة أعمدة أساسية")
+    # المزود يرجّع status=error مع رسالة واضحة
+    if isinstance(payload, dict) and payload.get("status") == "error":
+        message = payload.get("message", "خطأ غير معروف")
+        raise NotEnoughData(message)
 
-    if "Volume" not in data.columns:
-        data["Volume"] = 0
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not values:
+        raise NotEnoughData(f"ما فيه بيانات متاحة لـ {symbol_key.upper()}")
 
-    data = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    frame = pd.DataFrame(values)
+    frame["datetime"] = pd.to_datetime(frame["datetime"])
+    frame = frame.set_index("datetime").sort_index()
 
-    # قص الفترة المطلوبة
-    cutoff = datetime.now() - timedelta(days=config["days"])
-    data = data[data.index >= cutoff]
+    rename_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    frame = frame.rename(columns=rename_map)
 
-    # تجميع شموع الساعة إلى 4 ساعات
-    if config["resample"]:
-        data = data.resample(config["resample"]).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }).dropna()
+    for column in ["Open", "High", "Low", "Close"]:
+        if column not in frame.columns:
+            raise NotEnoughData("البيانات ناقصة أعمدة أساسية")
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-    if len(data) < 60:
+    if "Volume" in frame.columns:
+        frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
+    else:
+        frame["Volume"] = 0
+
+    frame = frame[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+    if len(frame) < 60:
         raise NotEnoughData(
-            f"عدد الشموع المتاحة {len(data)} فقط — قليل للتحليل"
+            f"عدد الشموع المتاحة {len(frame)} فقط — قليل للتحليل"
         )
 
-    return data
+    return frame
 
 
 def moving_average(series: pd.Series, length: int) -> pd.Series:
@@ -269,8 +238,6 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         risk = "عالية"
 
-    last_candle = data.index[-1]
-
     return {
         "symbol": symbol_key.upper(),
         "timeframe": TIMEFRAMES[timeframe]["label"],
@@ -290,5 +257,5 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
         "reasons": reasons,
         "candles": len(data),
         "ma200_available": ma200_value is not None,
-        "last_update": last_candle.strftime("%Y-%m-%d"),
+        "last_update": data.index[-1].strftime("%Y-%m-%d %H:%M"),
     }
