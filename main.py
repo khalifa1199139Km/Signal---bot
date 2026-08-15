@@ -25,9 +25,12 @@ WELCOME = """<b>📊 بوت تحليل الذهب والأسهم</b>
 <b>الاستخدام:</b>
 <code>/analyze NVDA</code> — تحليل يومي
 <code>/analyze NVDA 4h</code> — فريم 4 ساعات
-<code>/analyze GOLD 1h</code> — فريم ساعة
+<code>/analyze GOLD 2h</code> — فريم ساعتين
 
-<b>الفريمات:</b> 1h · 4h · 1d
+<b>الفريمات:</b>
+<code>1m</code> · <code>5m</code> · <code>15m</code> · <code>30m</code> · <code>45m</code>
+<code>1h</code> · <code>2h</code> · <code>4h</code> · <code>8h</code>
+<code>1d</code> · <code>1w</code> · <code>1M</code>
 
 <code>/list</code> — الرموز المتابعة
 
@@ -84,6 +87,12 @@ def build_message(result: dict) -> str:
             "<i>⚠️ تاريخ السعر قصير — التحليل أقل موثوقية.</i>",
         ]
 
+    if result.get("noisy"):
+        lines += [
+            "",
+            "<i>⚠️ فريم قصير — إشارات كثيرة وأغلبها ضجيج.</i>",
+        ]
+
     lines += [
         "",
         "<i>مؤشرات فنية فقط، مو توصية. تحقق بنفسك قبل أي صفقة.</i>",
@@ -112,11 +121,16 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     symbol = context.args[0].upper()
-    timeframe = context.args[1].lower() if len(context.args) > 1 else "1d"
+    if len(context.args) > 1:
+        raw = context.args[1]
+        timeframe = raw if raw in TIMEFRAMES else raw.lower()
+    else:
+        timeframe = "1d"
 
     if timeframe not in TIMEFRAMES:
+        available = " · ".join(TIMEFRAMES.keys())
         await update.message.reply_text(
-            f"الفريم <code>{timeframe}</code> غير مدعوم.\nالمتاح: 1h · 4h · 1d",
+            f"الفريم <code>{timeframe}</code> غير مدعوم.\nالمتاح: {available}",
             parse_mode=ParseMode.HTML,
         )
         return
