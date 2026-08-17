@@ -59,9 +59,22 @@ def build_message(result: dict) -> str:
     ]
 
     if result["signal"] != "HOLD":
+        if result.get("entry_mode") == "pullback":
+            zone_low = format_price(result["zone_low"])
+            zone_high = format_price(result["zone_high"])
+            lines += [
+                "",
+                "⏳ <b>السعر ممتد — انتظر ارتداد</b>",
+                f"📍 منطقة الدخول: <code>{zone_low}</code> — <code>{zone_high}</code>",
+            ]
+        else:
+            lines += [
+                "",
+                "✅ <b>السعر قريب من المتوسط — دخول مباشر</b>",
+                f"📍 دخول: <code>{format_price(result['entry'])}</code>",
+            ]
+
         lines += [
-            "",
-            f"📍 دخول: <code>{format_price(result['entry'])}</code>",
             f"🛑 وقف الخسارة: <code>{format_price(result['stop_loss'])}</code>",
             f"🎯 هدف 1: <code>{format_price(result['take_profit_1'])}</code>",
             f"🎯 هدف 2: <code>{format_price(result['take_profit_2'])}</code>",
@@ -70,6 +83,7 @@ def build_message(result: dict) -> str:
     lines += [
         "",
         f"📈 الاتجاه: <b>{result['trend']}</b>",
+        f"📏 البعد عن متوسط 20: {result['extension']:+.1f}× ATR",
         f"📉 RSI: {result['rsi']:.0f} — {result['rsi_state']}",
         f"🔻 دعم: {format_price(result['support'])}",
         f"🔺 مقاومة: {format_price(result['resistance'])}",
@@ -95,7 +109,7 @@ def build_message(result: dict) -> str:
 
     lines += [
         "",
-        "<i>مؤشرات فنية فقط، مو توصية. تحقق بنفسك قبل أي صفقة.</i>",
+        "<i>مؤشرات فنية فقط، مو توصية. الارتداد قد لا يجي — لو اخترق صعوداً بقوة، الصفقة تفوت.</i>",
     ]
 
     return "\n".join(lines)
