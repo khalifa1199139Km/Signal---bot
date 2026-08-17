@@ -174,9 +174,11 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     close = data["Close"]
     price = float(close.iloc[-1])
 
+    ma20 = moving_average(close, 20)
     ma50 = moving_average(close, 50)
     ma200 = moving_average(close, 200)
 
+    ma20_value = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else price
     ma50_value = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
     ma200_value = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else None
 
@@ -230,16 +232,52 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
     else:
         signal = "HOLD"
 
+    # كم السعر مبتعد عن متوسط 20 — بوحدات ATR
+    extension = (price - ma20_value) / atr_value if atr_value else 0.0
+
+    # عتبة الامتداد: فوقها يعتبر السعر ركض بعيد ويحتاج ارتداد
+    EXTENSION_LIMIT = 1.0
+
+    entry_mode = "now"
+    zone_low = zone_high = None
+
     if signal == "BUY":
-        entry = price
-        stop_loss = price - (atr_value * 1.5)
-        take_profit_1 = price + (atr_value * 2)
-        take_profit_2 = price + (atr_value * 3.5)
+        if extension > EXTENSION_LIMIT:
+            entry_mode = "pullback"
+            # منطقة الارتداد: بين متوسط 20 (أو الدعم) وبين نصف ATR تحت السعر
+            zone_high = price - (atr_value * 0.5)
+            zone_low = max(ma20_value, support)
+            if zone_low >= zone_high:
+                zone_low = zone_high - atr_value
+            entry = (zone_low + zone_high) / 2
+            reasons.append(
+                f"السعر مبتعد {extension:.1f}× ATR فوق متوسط 20 — يفضّل انتظار ارتداد"
+            )
+        else:
+            entry = price
+
+        stop_loss = entry - (atr_value * 1.5)
+        take_profit_1 = entry + (atr_value * 2)
+        take_profit_2 = entry + (atr_value * 3.5)
+
     elif signal == "SELL":
-        entry = price
-        stop_loss = price + (atr_value * 1.5)
-        take_profit_1 = price - (atr_value * 2)
-        take_profit_2 = price - (atr_value * 3.5)
+        if extension < -EXTENSION_LIMIT:
+            entry_mode = "pullback"
+            zone_low = price + (atr_value * 0.5)
+            zone_high = min(ma20_value, resistance)
+            if zone_high <= zone_low:
+                zone_high = zone_low + atr_value
+            entry = (zone_low + zone_high) / 2
+            reasons.append(
+                f"السعر مبتعد {abs(extension):.1f}× ATR تحت متوسط 20 — يفضّل انتظار ارتداد"
+            )
+        else:
+            entry = price
+
+        stop_loss = entry + (atr_value * 1.5)
+        take_profit_1 = entry - (atr_value * 2)
+        take_profit_2 = entry - (atr_value * 3.5)
+
     else:
         entry = stop_loss = take_profit_1 = take_profit_2 = None
 
@@ -256,6 +294,11 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
         "price": price,
         "signal": signal,
         "entry": entry,
+        "entry_mode": entry_mode,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "extension": extension,
+        "ma20": ma20_value,
         "stop_loss": stop_loss,
         "take_profit_1": take_profit_1,
         "take_profit_2": take_profit_2,
