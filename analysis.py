@@ -1,5 +1,12 @@
 """
-تحليل فني للأسهم والذهب.
+تحليل فني للأسهم والذهب مبني على كتاب Technical Analysis Explained.
+
+القرار يُبنى على بنية السعر أولاً (قمم وقيعان)، ثم تؤكده المؤشرات:
+  • الاتجاه من تسلسل القمم والقيعان — لا من موقع السعر من متوسط.
+  • الاتجاه الكبير يحدد جهة الصفقة، والصغير يحدد توقيت الدخول.
+  • السوق العرضي = لا صفقة.
+  • الدخول من منطقة تصحيح 33-50٪، والخروج إذا تجاوز التصحيح الثلثين.
+
 البيانات من Twelve Data — يحتاج مفتاح مجاني من twelvedata.com
 """
 
@@ -7,6 +14,9 @@ import os
 
 import pandas as pd
 import requests
+
+import indicators
+import structure
 
 # الرموز المتابَعة. المفتاح = ما تكتبه أنت، القيمة = رمز Twelve Data
 SYMBOLS = {
@@ -52,6 +62,16 @@ TIMEFRAMES = {
 NOISY_TIMEFRAMES = {"1m", "5m", "15m"}
 
 API_URL = "https://api.twelvedata.com/time_series"
+
+# عرض نافذة القمم والقيعان: الكبيرة تعطي الاتجاه الرئيسي، والصغيرة تعطي التصحيح.
+# الكتاب يصنّف الاتجاهات لطويل ومتوسط وقصير، والنافذة الضيقة تلتقط القصير فقط،
+# فنجعل عرضها يتناسب مع طول التاريخ المتاح حتى تمثّل الاتجاه الأكبر فعلاً.
+MIN_PIVOT_WIDTH = 8
+MAX_PIVOT_WIDTH = 18
+MINOR_PIVOT_WIDTH = 3
+
+# الحد الأدنى للشموع — نحتاج تاريخاً يكفي لتكوّن قمم وقيعان مؤكدة
+MIN_CANDLES = 60
 
 
 class NotEnoughData(Exception):
@@ -115,7 +135,7 @@ def fetch_candles(symbol_key: str, timeframe: str) -> pd.DataFrame:
 
     frame = frame[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
-    if len(frame) < 60:
+    if len(frame) < MIN_CANDLES:
         raise NotEnoughData(
             f"عدد الشموع المتاحة {len(frame)} فقط — قليل للتحليل"
         )
@@ -123,163 +143,296 @@ def fetch_candles(symbol_key: str, timeframe: str) -> pd.DataFrame:
     return frame
 
 
-def moving_average(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(window=length).mean()
+def pivot_width(count: int) -> int:
+    """
+    عرض نافذة القمم الكبرى.
+
+    معايرة على سلاسل مولّدة بميل معلوم: العرض ~16 على 400 شمعة يقلّل
+    أخطر خطأ ممكن — أن يُقرأ الاتجاه معكوساً — دون أن يكثر «غير محدد».
+    النوافذ الأضيق تلتقط الاتجاه القصير وتظنه الاتجاه الرئيسي.
+    """
+    return max(MIN_PIVOT_WIDTH, min(MAX_PIVOT_WIDTH, count // 25))
 
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    """مؤشر القوة النسبية بطريقة Wilder."""
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+def moving_average_conflict(trend: str, price: float, ma200: float, ma50_rising: bool) -> bool:
+    """
+    المتوسط المتحرك مؤشر اتجاه متأخر: صعوده يدل على اتجاه صاعد ونزوله على هابط.
+    فإذا عاكس الدليلان معاً (موقع السعر من متوسط 200 وميل متوسط 50) ما تقوله
+    بنية السعر، فالاتجاه غير محسوم — والكتاب يحذّر من التداول ضد الاتجاه.
+    """
+    if ma200 is None or ma50_rising is None:
+        return False
 
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + rs))
-
-
-def atr(data: pd.DataFrame, length: int = 14) -> pd.Series:
-    """متوسط المدى الحقيقي — مقياس التذبذب."""
-    high_low = data["High"] - data["Low"]
-    high_close = (data["High"] - data["Close"].shift()).abs()
-    low_close = (data["Low"] - data["Close"].shift()).abs()
-
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return true_range.ewm(alpha=1 / length, adjust=False).mean()
+    bullish = trend == "صاعد"
+    return (price > ma200) != bullish and ma50_rising != bullish
 
 
-def find_levels(data: pd.DataFrame, lookback: int = 40):
-    """أقرب دعم ومقاومة من قمم وقيعان الفترة الأخيرة."""
-    recent = data.tail(lookback)
-    price = float(data["Close"].iloc[-1])
+def rsi_thresholds(trend: str) -> tuple:
+    """
+    الكتاب: 70/30 هي العتبات المعتادة، لكن في السوق الصاعد يُعتبر 80
+    هو التشبع الشرائي، وفي السوق الهابط يُعتبر 20 هو التشبع البيعي.
+    """
+    if trend == "صاعد":
+        return 80.0, 30.0
+    if trend == "هابط":
+        return 70.0, 20.0
+    return 70.0, 30.0
 
-    highs = recent["High"]
-    lows = recent["Low"]
 
-    resistance_candidates = highs[highs > price]
-    support_candidates = lows[lows < price]
+def _build_trade(trend: str, price: float, leg: dict, retr: dict, atr_value: float) -> dict:
+    """
+    يبني الصفقة من بنية السعر:
+      • الدخول من منطقة التصحيح 33-50٪.
+      • الوقف خلف مستوى الثلثين — تجاوزه يعني أن التصحيح صار انعكاساً.
+      • الهدف الأول قمة/قاع الموجة، والثاني إسقاط طول الموجة من الدخول.
+    """
+    zone_low = min(retr["entry_low"], retr["entry_high"])
+    zone_high = max(retr["entry_low"], retr["entry_high"])
 
-    resistance = float(resistance_candidates.min()) if not resistance_candidates.empty else float(highs.max())
-    support = float(support_candidates.max()) if not support_candidates.empty else float(lows.min())
+    if retr["state"] == "shallow":
+        # لم يصحح بعد بالقدر الكافي — ننتظره داخل المنطقة
+        entry_mode = "pullback"
+        entry = (zone_low + zone_high) / 2
+    else:
+        entry_mode = "now"
+        entry = price
 
-    return support, resistance
+    invalidation = retr["invalidation"]
+    buffer = atr_value * 0.25
+
+    stop_basis = "مستوى 66٪"
+
+    if trend == "صاعد":
+        stop_loss = invalidation - buffer
+        # لو صار الوقف قريباً جداً من الدخول نرجع للقاع البنيوي للموجة:
+        # كسره يعني قاعاً أدنى، أي انكسار تسلسل القيعان الصاعدة
+        if entry - stop_loss < atr_value * 0.5:
+            stop_loss = leg["low"] - buffer
+            stop_basis = "قاع الموجة"
+        take_profit_1 = leg["high"]
+        take_profit_2 = entry + retr["span"]
+    else:
+        stop_loss = invalidation + buffer
+        if stop_loss - entry < atr_value * 0.5:
+            stop_loss = leg["high"] + buffer
+            stop_basis = "قمة الموجة"
+        take_profit_1 = leg["low"]
+        take_profit_2 = entry - retr["span"]
+
+    risk_size = abs(entry - stop_loss)
+    reward_size = abs(take_profit_1 - entry)
+    risk_reward = reward_size / risk_size if risk_size else 0.0
+
+    return {
+        "entry": entry,
+        "entry_mode": entry_mode,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "stop_loss": stop_loss,
+        "stop_basis": stop_basis,
+        "take_profit_1": take_profit_1,
+        "take_profit_2": take_profit_2,
+        "risk_reward": risk_reward,
+    }
 
 
 def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
-    """يحسب كل المؤشرات ويرجّع نتيجة جاهزة للعرض."""
+    """يقرأ بنية السعر ويؤكدها بالمؤشرات ويرجّع نتيجة جاهزة للعرض."""
     data = fetch_candles(symbol_key, timeframe)
 
     close = data["Close"]
     price = float(close.iloc[-1])
+    last_position = len(data) - 1
 
-    ma20 = moving_average(close, 20)
-    ma50 = moving_average(close, 50)
-    ma200 = moving_average(close, 200)
+    atr_value = float(indicators.atr(data).iloc[-1])
+    atr_percent = (atr_value / price) * 100 if price else 0.0
+    # هامش نعتبر ضمنه المستويين «متساويين» — نصف مدى الشمعة المعتاد
+    tolerance = atr_value * 0.5
 
-    ma20_value = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else price
-    ma50_value = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
-    ma200_value = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else None
+    # ── بنية السعر: الاتجاه الكبير يقرر الجهة، والصغير يقرر التوقيت ──
+    major_pivots = structure.find_pivots(data, pivot_width(len(data)))
+    minor_pivots = structure.find_pivots(data, MINOR_PIVOT_WIDTH)
 
-    rsi_value = float(rsi(close).iloc[-1])
-    atr_value = float(atr(data).iloc[-1])
-    atr_percent = (atr_value / price) * 100
+    major = structure.classify_trend(major_pivots, tolerance)
+    minor = structure.classify_trend(minor_pivots, tolerance)
+    trend = major["trend"]
 
-    support, resistance = find_levels(data)
+    levels = structure.support_resistance(data, major_pivots or minor_pivots, price)
 
-    reasons = []
-    trend_score = 0
+    # ── المؤشرات المؤكدة ──
+    ma20 = indicators.sma(close, 20)
+    ma50 = indicators.sma(close, 50)
+    ma200 = indicators.sma(close, 200)
 
-    if ma50_value is not None:
-        if price > ma50_value:
-            trend_score += 1
-            reasons.append("السعر فوق متوسط 50")
-        else:
-            trend_score -= 1
-            reasons.append("السعر تحت متوسط 50")
+    ma50_value = None if pd.isna(ma50.iloc[-1]) else float(ma50.iloc[-1])
+    ma200_value = None if pd.isna(ma200.iloc[-1]) else float(ma200.iloc[-1])
+    ma20_value = price if pd.isna(ma20.iloc[-1]) else float(ma20.iloc[-1])
 
-    if ma200_value is not None:
-        if price > ma200_value:
-            trend_score += 1
-            reasons.append("السعر فوق متوسط 200")
-        else:
-            trend_score -= 1
-            reasons.append("السعر تحت متوسط 200")
-    else:
-        reasons.append("متوسط 200 غير متاح — تاريخ السعر قصير")
+    # ميل متوسط 50: الكتاب يعتبر اتجاه المتوسط نفسه دليل اتجاه
+    ma50_rising = None
+    if ma50_value is not None and len(ma50.dropna()) > 5:
+        ma50_rising = bool(ma50.iloc[-1] > ma50.iloc[-6])
 
-    if trend_score >= 2:
-        trend = "صاعد"
-    elif trend_score <= -2:
-        trend = "هابط"
-    else:
-        trend = "عرضي"
-
-    if rsi_value >= 70:
+    rsi_value = float(indicators.rsi(close).iloc[-1])
+    overbought, oversold = rsi_thresholds(trend)
+    if rsi_value >= overbought:
         rsi_state = "تشبع شرائي"
-        reasons.append(f"RSI {rsi_value:.0f} — تشبع شرائي")
-    elif rsi_value <= 30:
+    elif rsi_value <= oversold:
         rsi_state = "تشبع بيعي"
-        reasons.append(f"RSI {rsi_value:.0f} — تشبع بيعي")
     else:
         rsi_state = "محايد"
 
-    if trend == "صاعد" and rsi_value < 70:
-        signal = "BUY"
-    elif trend == "هابط" and rsi_value > 30:
-        signal = "SELL"
-    else:
+    macd_info = indicators.macd(close)
+    stoch_info = indicators.stochastic(data)
+    bands = indicators.bollinger(close)
+    volume_info = indicators.volume_profile(data)
+
+    line = structure.trendline(
+        minor_pivots,
+        "trough" if trend == "صاعد" else "peak",
+        last_position,
+        price,
+        tolerance,
+    )
+    pattern = structure.reversal_pattern(major, trend, price, tolerance)
+
+    confirmations = []
+    warnings = []
+    signal = "HOLD"
+    reasons = [major["reason"]]
+
+    # ── القرار ──
+    if trend in ("عرضي", "غير محدد"):
+        if trend == "عرضي":
+            reasons.append("في السوق العرضي أدوات تتبع الاتجاه لا تعمل — الأفضل الوقوف جانباً")
         signal = "HOLD"
-
-    # كم السعر مبتعد عن متوسط 20 — بوحدات ATR
-    extension = (price - ma20_value) / atr_value if atr_value else 0.0
-
-    # عتبة الامتداد: فوقها يعتبر السعر ركض بعيد ويحتاج ارتداد
-    EXTENSION_LIMIT = 1.0
-
-    entry_mode = "now"
-    zone_low = zone_high = None
-
-    if signal == "BUY":
-        if extension > EXTENSION_LIMIT:
-            entry_mode = "pullback"
-            # منطقة الارتداد: بين متوسط 20 (أو الدعم) وبين نصف ATR تحت السعر
-            zone_high = price - (atr_value * 0.5)
-            zone_low = max(ma20_value, support)
-            if zone_low >= zone_high:
-                zone_low = zone_high - atr_value
-            entry = (zone_low + zone_high) / 2
-            reasons.append(
-                f"السعر مبتعد {extension:.1f}× ATR فوق متوسط 20 — يفضّل انتظار ارتداد"
-            )
-        else:
-            entry = price
-
-        stop_loss = entry - (atr_value * 1.5)
-        take_profit_1 = entry + (atr_value * 2)
-        take_profit_2 = entry + (atr_value * 3.5)
-
-    elif signal == "SELL":
-        if extension < -EXTENSION_LIMIT:
-            entry_mode = "pullback"
-            zone_low = price + (atr_value * 0.5)
-            zone_high = min(ma20_value, resistance)
-            if zone_high <= zone_low:
-                zone_high = zone_low + atr_value
-            entry = (zone_low + zone_high) / 2
-            reasons.append(
-                f"السعر مبتعد {abs(extension):.1f}× ATR تحت متوسط 20 — يفضّل انتظار ارتداد"
-            )
-        else:
-            entry = price
-
-        stop_loss = entry + (atr_value * 1.5)
-        take_profit_1 = entry - (atr_value * 2)
-        take_profit_2 = entry - (atr_value * 3.5)
-
+        leg = retr = {}
+        trade = {}
     else:
-        entry = stop_loss = take_profit_1 = take_profit_2 = None
+        leg = structure.current_leg(data, major, trend)
+        retr = structure.retracement(leg, price, trend) if leg else {}
+
+        if not retr:
+            reasons.append("تعذّر قياس الموجة الأخيرة — لا صفقة")
+            trade = {}
+        elif retr["state"] == "broken":
+            signal = "HOLD"
+            reasons.append(
+                f"التصحيح بلغ {retr['percent'] * 100:.0f}٪ وتجاوز الثلثين — "
+                "التصحيح تحوّل إلى انعكاس"
+            )
+            trade = {}
+        elif pattern and pattern.get("complete") and pattern["direction"] != trend:
+            signal = "HOLD"
+            reasons.append(
+                f"{pattern['name']} مكتمل بكسر خط العنق — نمط انعكاسي ضد الاتجاه"
+            )
+            trade = {}
+        elif moving_average_conflict(trend, price, ma200_value, ma50_rising):
+            signal = "HOLD"
+            reasons.append(
+                "بنية السعر تشير لاتجاه والمتوسطات تشير لعكسه — الاتجاه غير محسوم"
+            )
+            trade = {}
+        elif line.get("available") and line.get("broken") and line.get("valid"):
+            signal = "HOLD"
+            reasons.append(
+                f"خط اتجاه معتمد ({line['touches']} لمسات) مُخترق — "
+                "من أقوى إنذارات تغيّر الاتجاه"
+            )
+            trade = {}
+        else:
+            signal = "BUY" if trend == "صاعد" else "SELL"
+            trade = _build_trade(trend, price, leg, retr, atr_value)
+
+            if retr["state"] == "shallow":
+                reasons.append(
+                    f"التصحيح {retr['percent'] * 100:.0f}٪ فقط — "
+                    "ننتظر نزوله لمنطقة الثلث/النصف"
+                )
+            elif retr["state"] == "zone":
+                reasons.append(
+                    f"التصحيح {retr['percent'] * 100:.0f}٪ — داخل منطقة الدخول المفضلة"
+                )
+            else:
+                reasons.append(
+                    f"التصحيح {retr['percent'] * 100:.0f}٪ — منطقة الثلثين، "
+                    "أقل مخاطرة لكنها آخر حد مقبول"
+                )
+
+    # ── التأكيدات والتحذيرات ──
+    if signal != "HOLD":
+        bullish = signal == "BUY"
+
+        if macd_info["bullish"] == bullish:
+            confirmations.append("MACD يؤكد الزخم في نفس الجهة")
+        else:
+            warnings.append("MACD في الجهة المعاكسة — الزخم لا يؤكد")
+
+        if ma50_rising is not None:
+            if ma50_rising == bullish:
+                confirmations.append("ميل متوسط 50 مع الاتجاه")
+            else:
+                warnings.append("ميل متوسط 50 ضد الاتجاه")
+
+        if ma200_value is not None:
+            if (price > ma200_value) == bullish:
+                confirmations.append("السعر في الجهة الصحيحة من متوسط 200")
+            else:
+                warnings.append("السعر في الجهة المعاكسة من متوسط 200")
+
+        if line.get("available"):
+            if line["broken"]:
+                # مبدأ المروحة: أول اختراق ليس انعكاساً، لكنه إنذار يُحسب
+                warnings.append("خط الاتجاه المبدئي مُخترق — أول إنذار بتغيّر الاتجاه")
+            elif line["valid"]:
+                confirmations.append(
+                    f"خط اتجاه معتمد صامد — {line['touches']} لمسات عبر {line['bars']} شمعة"
+                )
+
+        if volume_info["available"]:
+            if volume_info["state"] == "متناقص":
+                warnings.append("الحجم متناقص — الكتاب يعتبره إنذاراً بقرب انتهاء الاتجاه")
+            elif volume_info["state"] == "مرتفع":
+                confirmations.append("الحجم مرتفع ويؤكد الحركة")
+        else:
+            warnings.append("الحجم غير متاح لهذا الرمز — تأكيد ناقص")
+
+        if minor["trend"] == major["trend"]:
+            confirmations.append("الاتجاه الصغير عاد مع الكبير — التصحيح انتهى")
+        elif minor["trend"] not in ("عرضي", "غير محدد"):
+            reasons.append("الاتجاه الصغير ضد الكبير — هذا هو التصحيح نفسه")
+
+        if bullish and stoch_info["state"] == "تشبع شرائي":
+            warnings.append("ستوكاستك في تشبع شرائي — الدخول الآن متأخر")
+        elif not bullish and stoch_info["state"] == "تشبع بيعي":
+            warnings.append("ستوكاستك في تشبع بيعي — البيع الآن متأخر")
+
+        if bullish and rsi_value >= overbought:
+            warnings.append(f"RSI {rsi_value:.0f} فوق {overbought:.0f} — تشبع شرائي")
+        elif not bullish and rsi_value <= oversold:
+            warnings.append(f"RSI {rsi_value:.0f} تحت {oversold:.0f} — تشبع بيعي")
+
+        if pattern and not pattern.get("complete") and pattern["direction"] != trend:
+            warnings.append(f"{pattern['name']} قيد التكوّن — راقب خط العنق")
+
+        if bands["squeeze"]:
+            reasons.append("نطاقات بولنجر منكمشة — التذبذب على وشك الزيادة")
+
+        if trade and trade["risk_reward"] < 1:
+            warnings.append(
+                f"العائد مقابل المخاطرة {trade['risk_reward']:.1f} — الهدف أقرب من الوقف"
+            )
+
+    score = len(confirmations) - len(warnings)
+    if signal == "HOLD":
+        confidence = "—"
+    elif score >= 3:
+        confidence = "عالية"
+    elif score >= 0:
+        confidence = "متوسطة"
+    else:
+        confidence = "ضعيفة"
 
     if atr_percent < 1.5:
         risk = "منخفضة"
@@ -293,24 +446,47 @@ def analyze(symbol_key: str, timeframe: str = "1d") -> dict:
         "timeframe": TIMEFRAMES[timeframe]["label"],
         "price": price,
         "signal": signal,
-        "entry": entry,
-        "entry_mode": entry_mode,
-        "zone_low": zone_low,
-        "zone_high": zone_high,
-        "extension": extension,
-        "ma20": ma20_value,
-        "stop_loss": stop_loss,
-        "take_profit_1": take_profit_1,
-        "take_profit_2": take_profit_2,
+        "confidence": confidence,
         "trend": trend,
+        "minor_trend": minor["trend"],
+        "peak_state": major["peak_state"],
+        "trough_state": major["trough_state"],
+        "entry": trade.get("entry"),
+        "entry_mode": trade.get("entry_mode", "now"),
+        "zone_low": trade.get("zone_low"),
+        "zone_high": trade.get("zone_high"),
+        "stop_loss": trade.get("stop_loss"),
+        "stop_basis": trade.get("stop_basis"),
+        "take_profit_1": trade.get("take_profit_1"),
+        "take_profit_2": trade.get("take_profit_2"),
+        "risk_reward": trade.get("risk_reward"),
+        "retracement": retr.get("percent") if retr else None,
+        "retracement_state": retr.get("state") if retr else None,
+        "invalidation": retr.get("invalidation") if retr else None,
+        "leg_low": leg.get("low") if leg else None,
+        "leg_high": leg.get("high") if leg else None,
+        "support": levels["support"],
+        "resistance": levels["resistance"],
         "rsi": rsi_value,
         "rsi_state": rsi_state,
+        "rsi_overbought": overbought,
+        "rsi_oversold": oversold,
+        "macd": macd_info,
+        "stochastic": stoch_info,
+        "bollinger": bands,
+        "volume": volume_info,
+        "trendline": line,
+        "pattern": pattern,
+        "ma20": ma20_value,
+        "ma50": ma50_value,
+        "ma200": ma200_value,
         "atr_percent": atr_percent,
         "risk": risk,
-        "support": support,
-        "resistance": resistance,
         "reasons": reasons,
+        "confirmations": confirmations,
+        "warnings": warnings,
         "candles": len(data),
+        "major_pivots": len(major_pivots),
         "ma200_available": ma200_value is not None,
         "noisy": timeframe in NOISY_TIMEFRAMES,
         "last_update": data.index[-1].strftime("%Y-%m-%d %H:%M"),

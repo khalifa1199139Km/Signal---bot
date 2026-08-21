@@ -6,29 +6,38 @@ Guidance for Claude Code (and other AI assistants) working in this repository.
 
 A Telegram bot that runs technical analysis on gold and US stocks on demand.
 A user sends `/analyze NVDA 4h`; the bot fetches candles from Twelve Data,
-computes indicators with pandas, and replies with a formatted signal
-(BUY / SELL / HOLD) including entry, stop loss, and two take-profit levels.
+reads the price structure, and replies with a formatted signal (BUY / SELL /
+HOLD) including an entry zone, stop loss, and two take-profit levels.
 
 The entire user-facing interface is **Arabic**. The code, identifiers, and
 signal keywords are English.
 
-## Layout
+**The decision method is classical technical analysis, not indicator
+thresholds.** Trend is defined by the sequence of peaks and troughs; moving
+averages and oscillators only confirm. Read "Analysis rules as implemented"
+below before changing any decision logic — those rules are the product.
 
-The project is intentionally two files — do not introduce a package structure
-or extra layers unless a change genuinely needs it.
+## Layout
 
 | File | Role |
 | --- | --- |
-| `analysis.py` | Data fetching + all indicator math. Pure logic, no Telegram imports. |
+| `structure.py` | Price structure: pivots, trend from peaks/troughs, support/resistance, trendlines, retracements, reversal patterns. No indicators. |
+| `indicators.py` | Indicator math only: SMA/EMA, RSI, ATR, MACD, Stochastic, Bollinger, volume. Pure functions over a DataFrame. |
+| `analysis.py` | Data fetching + the decision engine that combines the two above into one result dict. |
 | `main.py` | Telegram wiring, command handlers, and message formatting. |
+| `selftest.py` | Synthetic-candle tests. No API key, no quota. |
 | `requirements.txt` | Pinned deps: `python-telegram-bot`, `pandas`, `requests`. |
 | `Procfile` | `worker: python main.py` — deployed as a long-running worker (polling), not a web dyno. |
-| `.gitignore` | `.env`, `__pycache__/`, `*.pyc`. |
 
-**Keep the boundary:** `analysis.py` must never import from `telegram` or
-produce display strings with markup. `main.py` must never do indicator math.
-Everything crosses the boundary through the single dict returned by
-`analyze()`.
+**Keep the boundaries:**
+
+- `structure.py` and `indicators.py` never import `telegram`, never fetch, and
+  never make decisions — they compute and return facts.
+- `analysis.py` owns every decision and every Arabic explanation string.
+- `main.py` never does math; it only formats the result dict.
+
+Everything crosses into the presentation layer through the single dict
+returned by `analyze()`.
 
 ## Environment variables
 
@@ -50,7 +59,10 @@ pip install -r requirements.txt
 # Run the bot (long-polling; drops pending updates on startup)
 BOT_TOKEN=... TWELVE_DATA_KEY=... python main.py
 
-# Exercise the analysis path without Telegram — the fastest feedback loop
+# Verify the decision rules — no API key needed, no quota burned
+python selftest.py
+
+# Inspect a real symbol end to end without Telegram
 TWELVE_DATA_KEY=... python -c "
 from analysis import analyze
 from main import build_message
@@ -58,58 +70,107 @@ print(build_message(analyze('NVDA', '1d')))
 "
 ```
 
-There is **no test suite, no linter config, and no CI**. Verification is manual:
-run the snippet above against a couple of symbols and timeframes, and confirm
-the module still imports cleanly (`python -c "import main, analysis"`). Do not
-claim a change is tested when it was only imported. Every live check burns API
-quota, so prefer one targeted run over a sweep across symbols.
+`selftest.py` is the first thing to run after touching decision logic. It
+builds candles with known structure and asserts the rules hold: named patterns
+map to the expected trend and signal, edge cases (zero volume, flat price,
+crash) neither crash nor leak `None`/`nan` into the message, and — the property
+that matters most — **no signal is ever issued against the true trend** over
+180 generated series. If that last number moves off zero, something in the
+trend chain broke.
+
+There is no CI and no linter config. Live checks against the API burn quota, so
+prefer `selftest.py` and reserve one targeted live run for confirming the
+message renders.
 
 Only one bot process may poll a given token at a time — running `main.py`
 locally while a deployment is live will cause Telegram conflict errors.
 
 ## The `analyze()` contract
 
-`analyze(symbol_key, timeframe) -> dict` is the one interface between the two
-modules. `build_message()` in `main.py` reads these keys directly, so **adding
-or renaming a key means updating `build_message()` in the same change**:
+`analyze(symbol_key, timeframe) -> dict` is the one interface into the
+presentation layer. `build_message()` in `main.py` reads these keys directly,
+so **adding or renaming a key means updating `build_message()` in the same
+change**:
 
-`symbol`, `timeframe` (the Arabic label, not the key), `price`, `signal`,
-`entry`, `entry_mode`, `zone_low`, `zone_high`, `extension`, `ma20`,
-`stop_loss`, `take_profit_1`, `take_profit_2`, `trend`, `rsi`, `rsi_state`,
-`atr_percent`, `risk`, `support`, `resistance`, `reasons`, `candles`,
-`ma200_available`, `noisy`, `last_update`.
+- Identity: `symbol`, `timeframe` (Arabic label), `price`, `last_update`,
+  `candles`, `major_pivots`
+- Decision: `signal`, `confidence`, `trend`, `minor_trend`, `peak_state`,
+  `trough_state`
+- Trade: `entry`, `entry_mode`, `zone_low`, `zone_high`, `stop_loss`,
+  `stop_basis`, `take_profit_1`, `take_profit_2`, `risk_reward`
+- Structure: `retracement`, `retracement_state`, `invalidation`, `leg_low`,
+  `leg_high`, `support`, `resistance`, `trendline`, `pattern`
+- Indicators: `rsi`, `rsi_state`, `rsi_overbought`, `rsi_oversold`, `macd`,
+  `stochastic`, `bollinger`, `volume`, `ma20`, `ma50`, `ma200`
+- Narrative: `reasons`, `confirmations`, `warnings`
+- Flags: `atr_percent`, `risk`, `ma200_available`, `noisy`
 
-When `signal == "HOLD"`, the five trade-level keys (`entry`, `stop_loss`,
-`take_profit_1`, `take_profit_2`, and the zone bounds) are `None`, and
-`build_message()` skips that block entirely. Any new consumer must handle that.
+On `HOLD`, **every key in the Trade group is `None`** and `confidence` is `"—"`;
+`build_message()` skips that block entirely. Any new consumer must handle it.
+`retracement`, `leg_low`, and `leg_high` are also `None` whenever the trend is
+not directional.
 
-`last_update` and `candles` are currently computed but not rendered — they are
-available if a message ever needs them.
+`macd`, `stochastic`, `bollinger`, `volume`, `trendline`, and `pattern` are
+nested dicts, not scalars. `pattern` is `{}` when no reversal pattern applies.
 
 ## Analysis rules as implemented
 
-Change these deliberately; they define the bot's output.
+These are the product. Change them deliberately, and run `selftest.py` after.
 
-- **Indicators:** SMA 20 / 50 / 200, Wilder RSI(14) via `ewm(alpha=1/14)`,
-  Wilder ATR(14) on true range. `find_levels()` takes support/resistance from
-  the nearest high above and low below the current price over the last 40 candles.
-- **Trend:** +1 if price is above MA50, +1 if above MA200 (−1 each if below).
-  Score ≥ 2 → صاعد, ≤ −2 → هابط, else عرضي. If there are fewer than 200 candles,
-  MA200 is unavailable, the score cannot reach ±2, and the trend is always عرضي —
-  which forces HOLD. This is why `ma200_available` exists and why the message
-  carries a reliability warning.
-- **Signal:** BUY when trend is صاعد and RSI < 70; SELL when هابط and RSI > 30;
-  otherwise HOLD.
-- **Extension / entry mode:** `extension = (price − MA20) / ATR`. Past
-  `EXTENSION_LIMIT = 1.0` ATR in the signal's direction, `entry_mode` becomes
-  `"pullback"` and the bot quotes an entry *zone* instead of a price; otherwise
-  `"now"` with a direct entry at the current price.
-- **Levels:** stop loss at 1.5× ATR against the entry, targets at 2× and 3.5× ATR
-  in favor. All derived from `entry`, not from `price` — so pullback entries move
-  the whole set.
-- **Risk label:** by `atr_percent` — < 1.5% منخفضة, < 3.5% متوسطة, else عالية.
-- **`reasons`** is an ordered list of Arabic strings built up during analysis and
-  rendered as bullets. Append to it when adding a rule so the user sees the "why".
+**Trend comes from structure, not from indicators.** `find_pivots()` marks a
+bar as a peak when its high dominates `width` bars on each side (troughs
+mirror it), then `_alternate()` keeps a clean peak/trough zigzag. A trend is
+up only when the last two peaks *and* the last two troughs are both higher;
+down when both are lower; sideways otherwise. Comparisons use a tolerance of
+0.5×ATR, so "equal" means equal within normal bar noise.
+
+**Two degrees of trend.** Wide pivots give the trend that decides the
+direction of the trade; `MINOR_PIVOT_WIDTH = 3` gives the correction inside it,
+used for entry timing and for the trendline. `pivot_width()` scales the wide
+window with history length (`count // 25`, clamped to 8–18). This constant is
+calibrated, not guessed: on generated series with known drift, ~16 minimises
+reading the trend backwards while keeping "undecided" rare. **Narrowing it
+makes the bot mistake short-term swings for the primary trend and trade against
+it** — that was a real bug, caught by `selftest.py`.
+
+**Sideways means no trade.** Trend-following tools do not work in a trendless
+market, so the bot stands aside rather than trading the range.
+
+**Entry comes from the retracement, not from the current price.** The last
+impulse leg runs from the most recent confirmed trough to the highest high
+since it (mirrored in a downtrend). The 33%–50% retracement band is the entry
+zone; 66% is the last acceptable level. `retracement_state` is one of
+`shallow` (hasn't corrected yet → quote the zone and wait), `zone` (preferred
+→ enter now), `deep` (past 50% but within 66% → enter, flagged), or `broken`
+(past 66% → the correction became a reversal, no trade).
+
+**Stop marks where the read is wrong**, not a fixed ATR multiple: just beyond
+the 66% level, falling back to the leg's own extreme when that would sit within
+0.5×ATR of the entry. `stop_basis` records which one was used and the message
+must quote it — never hardcode the label.
+
+**Targets come from structure**: target 1 is the leg's peak/trough (the level
+that must break for the trend to continue), target 2 projects the leg's own
+length from the entry. `risk_reward` is computed against target 1.
+
+**Four things block a trade outright:** a sideways or undecided trend, a
+retracement past 66%, a completed double top/bottom against the trend, and a
+break of an *established* trendline (3+ touches). A break of a tentative
+2-touch line is only a warning — the first break is not yet a reversal.
+
+**Indicators confirm; they never decide.** MACD direction, MA50 slope, price
+vs MA200, trendline touches, volume, and the minor trend each add a line to
+`confirmations` or `warnings`; `confidence` is their net score. The one place
+indicators can veto is `moving_average_conflict()`: when *both* the MA200
+position and the MA50 slope oppose the structural trend, the trend is treated
+as unresolved and no trade is issued.
+
+**RSI thresholds move with the trend**: 80/30 in an uptrend, 70/20 in a
+downtrend, 70/30 otherwise — an overbought reading means less in a bull market.
+
+**Volume is optional.** Spot gold returns zero volume from the provider, so
+`volume_profile()` reports `available: False` and the engine degrades to a
+warning about the missing confirmation rather than failing.
 
 ## Symbols and timeframes
 
@@ -122,7 +183,7 @@ back to the uppercased user input, so any symbol Twelve Data knows already works
 **Adding a timeframe:** add to `TIMEFRAMES` with a valid Twelve Data `interval`,
 an `outputsize`, and an Arabic `label`. Then update the timeframe list in
 `WELCOME` in `main.py`, and add it to `NOISY_TIMEFRAMES` if it is short enough to
-be mostly noise. Keep `size` at 200+ or MA200 will never be available.
+be mostly noise. Keep `size` at 200+ or MA200 will never be available, and well above `MIN_CANDLES` (60) or there will be too few pivots to read a trend.
 
 **Case gotcha:** `1M` (monthly) and `1m` (one minute) differ only by case.
 `analyze_command()` keeps the raw argument when it matches a `TIMEFRAMES` key
